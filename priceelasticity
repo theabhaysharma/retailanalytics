@@ -1,0 +1,227 @@
+import pandas as pd
+import networkx as nx
+import numpy as np
+from scipy.stats import norm
+from collections import defaultdict
+import statsmodels.api as sm
+
+np.random.seed(42)  # For reproducibility
+
+n_transactions = 500  #  number of transactions
+products = ['A', 'B', 'C', 'D', 'E']
+
+data = []
+for i in range(n_transactions):
+    # Choose 2-3 products for each transaction
+    n_products = np.random.choice([2, 3])
+    
+    # Ensure substitutes rarely appear together
+    if np.random.random() < 0.8:  # 80% chance of choosing from one substitute group
+        if np.random.random() < 0.5:
+            available_products = ['A', 'B', 'E']
+        else:
+            available_products = ['C', 'D', 'E']
+    else:
+        available_products = products
+    
+    chosen_products = np.random.choice(available_products, n_products, replace=False)
+    
+    for product in chosen_products:
+        quantity = np.random.randint(1, 5)
+        
+        
+        if product in ['A', 'B']:
+            price = np.random.uniform(8, 12)  
+        elif product in ['C', 'D']:
+            price = np.random.uniform(18, 22) 
+        else:
+            price = np.random.uniform(28, 32) 
+        
+        data.append({
+            'transaction_id': i + 1,
+            'product_id': product,
+            'quantity': quantity,
+            'price': round(price, 2)
+        })
+
+data = pd.DataFrame(data)
+
+def construct_bipartite_graph(data):
+    B = nx.Graph()
+    transactions = data['transaction_id'].unique()
+    products = data['product_id'].unique()
+    
+    B.add_nodes_from(transactions, bipartite=0)
+    B.add_nodes_from(products, bipartite=1)
+    
+    edges = list(zip(data['transaction_id'], data['product_id']))
+    B.add_edges_from(edges)
+    
+    return B, transactions, products
+
+def configuration_null_model(B, transaction_set, product_set, n_iter=1000):
+    results = defaultdict(list)
+
+    for _ in range(n_iter):
+        random_B = nx.bipartite.configuration_model(
+            [B.degree(n) for n in transaction_set],
+            [B.degree(n) for n in product_set]
+        )
+        random_B = nx.Graph(random_B)
+        random_B.remove_edges_from(nx.selfloop_edges(random_B))
+        
+        largest_cc = max(nx.connected_components(random_B), key=len)
+        random_B = random_B.subgraph(largest_cc).copy()
+        
+        random_nodes = list(random_B.nodes())
+        transaction_mapping = dict(zip(random_nodes[:len(transaction_set)], transaction_set))
+        product_mapping = dict(zip(random_nodes[len(transaction_set):], product_set))
+        random_B = nx.relabel_nodes(random_B, {**transaction_mapping, **product_mapping})
+
+        for p1 in product_set:
+            for p2 in product_set:
+                if p1 != p2 and random_B.has_node(p1) and random_B.has_node(p2):
+                    common = len(set(random_B.neighbors(p1)) & set(random_B.neighbors(p2)))
+                    results[(p1, p2)].append(common)
+    
+    mean_std = {k: (np.mean(v), np.std(v)) for k, v in results.items()}
+    return mean_std
+
+def calculate_complementarity_substitutability(B, mean_std, alpha=0.15, max_steps=3, z_threshold=1.0):
+    complementarity = []
+    substitutability = []
+
+    for (product1, product2), (mean, std) in mean_std.items():
+        if B.has_node(product1) and B.has_node(product2):
+            actual_common = len(set(B.neighbors(product1)) & set(B.neighbors(product2)))
+            
+            rw_score = 0
+            current_neighbors = set([product1])
+            for k in range(1, max_steps + 1):
+                next_neighbors = set().union(*(set(B.neighbors(n)) for n in current_neighbors))
+                common_at_step = len(next_neighbors & set(B.neighbors(product2)))
+                rw_score += alpha * (1 - alpha)**k * common_at_step
+                current_neighbors = next_neighbors
+            
+            z_score = (actual_common - mean) / (std + 1e-10)
+            combined_score = z_score * rw_score
+            
+            if combined_score > z_threshold:
+                complementarity.append((product1, product2, combined_score))
+            elif combined_score < -z_threshold:
+                substitutability.append((product1, product2, combined_score))
+    
+    return complementarity, substitutability
+
+def project_bipartite_to_unipartite(complementarity, substitutability):
+    P = nx.Graph()
+    
+    for product1, product2, score in complementarity:
+        P.add_edge(product1, product2, weight=abs(score), type='complement')
+    
+    for product1, product2, score in substitutability:
+        P.add_edge(product1, product2, weight=abs(score), type='substitute')
+    
+    return P
+
+def detect_communities(P):
+    return list(nx.algorithms.community.louvain_communities(P, weight='weight')) if P.number_of_edges() > 0 else []
+
+def extract_roles(P):
+    if P.number_of_nodes() == 0:
+        return {}
+    
+    centrality = nx.betweenness_centrality(P, weight='weight')
+    clustering = nx.clustering(P, weight='weight')
+    
+    mean_centrality = np.mean(list(centrality.values()))
+    mean_clustering = np.mean(list(clustering.values()))
+    
+    roles = {}
+    for node in P.nodes:
+        if centrality[node] > mean_centrality:
+            roles[node] = 'hub' if clustering[node] > mean_clustering else 'connector'
+        else:
+            roles[node] = 'peripheral' if clustering[node] > mean_clustering else 'satellite'
+    
+    return roles
+
+def validate_with_external_data(communities, external_data):
+    validation_results = {}
+    
+    for i, community in enumerate(communities):
+        community_categories = external_data[external_data['product_id'].isin(community)]['category']
+        if not community_categories.empty:
+            most_common_category = community_categories.mode().iloc[0]
+            category_purity = (community_categories == most_common_category).mean()
+            validation_results[f'Community_{i}'] = {
+                'size': len(community),
+                'most_common_category': most_common_category,
+                'category_purity': category_purity
+            }
+    
+    return validation_results
+
+def generate_insights(communities, roles, P):
+    top_complements = sorted([(u, v) for u, v, d in P.edges(data=True) if d['type'] == 'complement'], 
+                              key=lambda x: P[x[0]][x[1]]['weight'], reverse=True)[:5]
+    top_substitutes = sorted([(u, v) for u, v, d in P.edges(data=True) if d['type'] == 'substitute'], 
+                             key=lambda x: P[x[0]][x[1]]['weight'])[:5]
+    
+    return {
+        'communities': communities,
+        'roles': roles,
+        'top_complements': top_complements,
+        'top_substitutes': top_substitutes
+    }
+
+def calculate_price_elasticity(data):
+    elasticities = {}
+    for product in data['product_id'].unique():
+        product_data = data[data['product_id'] == product]
+        X = sm.add_constant(np.log(product_data['price']))
+        y = np.log(product_data['quantity'])
+        model = sm.OLS(y, X).fit()
+        elasticities[product] = model.params['price']
+    return elasticities
+
+def analyze_product_relationships(data, external_data, z_threshold=1.0, alpha=0.15, max_steps=3, n_iter=1000):
+    B, transactions, products = construct_bipartite_graph(data)
+    print(f"Bipartite graph: {B.number_of_nodes()} nodes, {B.number_of_edges()} edges")
+    
+    mean_std = configuration_null_model(B, transactions, products, n_iter)
+    complementarity, substitutability = calculate_complementarity_substitutability(B, mean_std, alpha, max_steps, z_threshold)
+    
+    P = project_bipartite_to_unipartite(complementarity, substitutability)
+    print(f"Unipartite graph: {P.number_of_nodes()} nodes, {P.number_of_edges()} edges")
+    
+    communities = detect_communities(P)
+    roles = extract_roles(P)
+    validation_results = validate_with_external_data(communities, external_data)
+    insights = generate_insights(communities, roles, P)
+    elasticities = calculate_price_elasticity(data)
+    
+    return {
+        'complementarity': complementarity,
+        'substitutability': substitutability,
+        'communities': communities,
+        'roles': roles,
+        'validation_results': validation_results,
+        'insights': insights,
+        'elasticities': elasticities
+    }
+
+# External data for validation
+external_data = pd.DataFrame({
+    'product_id': ['A', 'B', 'C', 'D', 'E'],
+    'category': ['Cat1', 'Cat1', 'Cat2', 'Cat2', 'Cat3']
+})
+
+# Analyze product relationships
+results = analyze_product_relationships(data, external_data)
+
+# Print the results
+for key, value in results.items():
+    print(f"{key.capitalize()}:")
+    print(value)
+    print()
